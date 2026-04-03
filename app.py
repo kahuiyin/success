@@ -216,6 +216,7 @@ def save_current_stage():
     stage_df["AI辅助"] = stage_config["ai_assist"]
     stage_df["偏见模式"] = stage_config["bias_mode"]
     stage_df["阶段总耗时（秒）"] = total_time
+    stage_df["压力条件"] = st.session_state.pressure_condition
 
     for k, v in st.session_state.experimenter_info.items():
         stage_df[f"实验者_{k}"] = v
