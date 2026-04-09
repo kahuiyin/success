@@ -15,7 +15,7 @@ from config import (
     RATING_WEIGHTS, BIAS_CONFIG, JOB_DESCRIPTION,
     ALGORITHM_LITERACY_ITEMS, ALGORITHM_DEPENDENCY_ITEMS,
     FIXED_PRESSURE_CONDITION,
-    RESUME_FOLDER, PHOTO_FOLDER          # 新增导入
+    RESUME_FOLDER, PHOTO_FOLDER
 )
 from core_rating import (
     read_excel_resume, batch_read_word_resumes, batch_rating,
@@ -24,7 +24,7 @@ from core_rating import (
     init_candidate_stay_time, update_candidate_stay_time,
     save_candidate_stay_time_data,
     get_stage_experiment_config,
-    auto_load_candidates                  # 新增导入
+    auto_load_candidates
 )
 
 # ===================== 全局初始化 =====================
@@ -51,8 +51,10 @@ def init_session_state():
         "stage_total_time": {},
         "pre_order": None,
         "scroll_to_top": False,
-        "dependency_completed": False,
-        "show_dependency_form": False,
+        "manipulation_check_done": False,
+        "post_confidence": {},
+        "show_manipulation_check": False,
+        "show_final_questionnaire": False,
         "show_thanks": False,
     }
     for key, value in default_states.items():
@@ -79,7 +81,7 @@ def save_progress():
         "target_hires": st.session_state.target_hires,
         "algorithm_literacy": st.session_state.algorithm_literacy,
         "pressure_condition": st.session_state.pressure_condition,
-        "dependency_completed": st.session_state.dependency_completed,
+        "manipulation_check_done": st.session_state.manipulation_check_done,
     }
     progress_path = os.path.join(st.session_state.experiment_dir, "progress.json")
     with open(progress_path, "w", encoding="utf-8") as f:
@@ -99,7 +101,7 @@ def load_progress():
             st.session_state.target_hires = progress.get("target_hires", 5)
             st.session_state.algorithm_literacy = progress.get("algorithm_literacy", [4] * len(ALGORITHM_LITERACY_ITEMS))
             st.session_state.pressure_condition = progress.get("pressure_condition", FIXED_PRESSURE_CONDITION)
-            st.session_state.dependency_completed = progress.get("dependency_completed", False)
+            st.session_state.manipulation_check_done = progress.get("manipulation_check_done", False)
 
             if st.session_state.stage_completed.get(st.session_state.current_stage, False):
                 csv_path = os.path.join(st.session_state.experiment_dir, f"stage_{st.session_state.current_stage}.csv")
@@ -111,6 +113,8 @@ def load_progress():
                     st.session_state.result_df = df
                     if "招聘决策" in df.columns:
                         st.session_state.decisions = dict(zip(df["候选人姓名"], df["招聘决策"]))
+                    if st.session_state.current_stage == "post" and "决策信心" in df.columns:
+                        st.session_state.post_confidence = dict(zip(df["候选人姓名"], df["决策信心"]))
         except Exception as e:
             st.warning(f"恢复进度失败：{e}")
 
@@ -201,6 +205,13 @@ def save_current_stage():
 
     stage_df["招聘决策"] = stage_df["候选人姓名"].map(st.session_state.decisions)
 
+    # 添加决策信心（仅post阶段）
+    if current == "post":
+        confidence_list = [st.session_state.post_confidence.get(name, 4) for name in stage_df["候选人姓名"]]
+        stage_df["决策信心"] = confidence_list
+    else:
+        stage_df["决策信心"] = ""
+
     decision_times = []
     mod_counts = []
     for _, row in stage_df.iterrows():
@@ -251,6 +262,8 @@ def load_stage_data(stage_key):
         st.session_state.result_df = df
         if "招聘决策" in df.columns:
             st.session_state.decisions = dict(zip(df["候选人姓名"], df["招聘决策"]))
+        if stage_key == "post" and "决策信心" in df.columns:
+            st.session_state.post_confidence = dict(zip(df["候选人姓名"], df["决策信心"]))
         return True
     return False
 
@@ -363,9 +376,18 @@ def switch_to_next_stage():
             return False
     next_stage = get_next_stage(current)
     if next_stage is None:
-        st.session_state.experiment_completed = True
+        # 所有阶段完成，先保存当前阶段（post），然后显示统一问卷
+        save_current_stage()  # 确保 post 阶段数据已保存
+        st.session_state.show_final_questionnaire = True
         st.rerun()
         return True
+
+    # 如果即将进入post阶段且尚未完成操纵检查，则显示操纵检查表单
+    if next_stage == "post" and not st.session_state.manipulation_check_done:
+        st.session_state.show_manipulation_check = True
+        st.rerun()
+        return False
+
     st.session_state.current_stage = next_stage
     st.session_state.result_df = pd.DataFrame()
     st.session_state.decisions = {}
@@ -406,53 +428,182 @@ def package_experiment_data():
     zip_buffer.seek(0)
     return zip_buffer
 
-def finalize_experiment():
-    """提交实验数据：先检查依赖量表，若未填则显示表单，否则打包下载"""
-    if not st.session_state.dependency_completed:
-        st.session_state.show_dependency_form = True
-        st.rerun()
-        return False
+# ===================== 生成汇总表（中文列名，分性别比例） =====================
+def generate_master_table():
+    """生成一个包含所有数据的扁平化表格（每个被试一行），列名为中文，并增加分性别录用比例"""
+    exp_dir = st.session_state.experiment_dir
+    if not exp_dir:
+        return
 
-    # 已填写依赖量表，执行打包下载
-    # 先保存当前阶段数据（确保最后阶段已保存）
-    if st.session_state.current_stage in get_stage_key_list():
-        if not save_current_stage():
-            st.error("保存当前阶段失败，请检查错误信息。")
-            return False
+    record = {}
 
-    if not all(st.session_state.stage_completed.values()):
-        missing = [s for s, done in st.session_state.stage_completed.items() if not done]
-        st.warning(f"以下阶段未完成：{missing}，无法提交。")
-        return False
+    # 1. 基本信息
+    record["被试编号"] = st.session_state.experimenter_id
+    info = st.session_state.experimenter_info
+    record["姓名"] = info.get("姓名", "")
+    record["学号/学校"] = info.get("学号", "")
+    record["性别"] = info.get("性别", "")
+    record["年龄"] = info.get("年龄", "")
+    record["专业"] = info.get("专业", "")
+    record["最高学历"] = info.get("学历", "")
+    record["对AI熟悉程度(1-7)"] = info.get("AI熟悉程度", "")
+    record["招聘经验(有/无)"] = info.get("招聘经验", "")
+    record["类似实验经验(是/否)"] = info.get("类似实验经验", "")
+    record["压力条件"] = st.session_state.pressure_condition
 
-    zip_buffer = package_experiment_data()
-    if zip_buffer is None:
-        return False
-    st.download_button(
-        label="📥 下载实验数据压缩包",
-        data=zip_buffer,
-        file_name=f"实验数据_{st.session_state.experimenter_id}.zip",
-        mime="application/zip"
-    )
-    st.success(f"数据打包完成！本地备份已保存在：{st.session_state.experiment_dir}")
-    return True
+    # 2. 算法素养（10题）
+    for i, score in enumerate(st.session_state.algorithm_literacy, 1):
+        record[f"算法素养_题{i}"] = score
+    record["算法素养_总分"] = sum(st.session_state.algorithm_literacy)
 
-def save_dependency_data(scores):
-    """保存算法依赖量表数据，并显示感谢界面"""
-    # 先保存当前阶段数据，确保最后阶段数据已写入
-    if st.session_state.current_stage in get_stage_key_list():
-        save_current_stage()
-    dep_data = {
-        "items": ALGORITHM_DEPENDENCY_ITEMS,
-        "scores": scores,
-        "total_score": sum(scores),
+    # 3. 操纵检查
+    manip_path = os.path.join(exp_dir, "manipulation_check.json")
+    if os.path.exists(manip_path):
+        with open(manip_path, "r", encoding="utf-8") as f:
+            m = json.load(f)
+        record["是否注意到AI偏差"] = m.get("bias_awareness", "")
+        record["偏差详情"] = m.get("bias_detail", "")
+
+    # 4. 事后回顾（从最终问卷中保存的数据）
+    final_path = os.path.join(exp_dir, "final_questionnaire.json")
+    if os.path.exists(final_path):
+        with open(final_path, "r", encoding="utf-8") as f:
+            fq = json.load(f)
+        record["AI公平性评分(1-7)"] = fq.get("fairness", "")
+        record["不自觉回忆AI分数(1-7)"] = fq.get("recall_ai_score", "")
+        record["AI影响程度(1-7)"] = fq.get("influence", "")
+        record["纠正行为"] = fq.get("correction_behavior", "")
+        record["反馈评论"] = fq.get("comments", "")
+
+    # 5. 算法依赖量表（6题）
+    dep_path = os.path.join(exp_dir, "algorithm_dependency.json")
+    if os.path.exists(dep_path):
+        with open(dep_path, "r", encoding="utf-8") as f:
+            dep = json.load(f)
+        scores = dep.get("scores", [])
+        for i, s in enumerate(scores, 1):
+            record[f"算法依赖_题{i}"] = s
+        record["算法依赖_总分"] = dep.get("total_score", 0)
+
+    # 6. 各阶段决策统计（增加分性别录用比例）
+    for stage in ["pre", "mid", "post"]:
+        csv_path = os.path.join(exp_dir, f"stage_{stage}.csv")
+        if os.path.exists(csv_path):
+            df = pd.read_csv(csv_path, encoding="utf-8-sig")
+            # 总录用/待定/拒绝
+            if "招聘决策" in df.columns:
+                record[f"{stage}_录用人数"] = (df["招聘决策"] == "进入面试").sum()
+                record[f"{stage}_待定人数"] = (df["招聘决策"] == "待定").sum()
+                record[f"{stage}_拒绝人数"] = (df["招聘决策"] == "拒绝").sum()
+
+                # 分性别录用比例
+                if "性别" in df.columns:
+                    # 男性
+                    male_df = df[df["性别"] == "男"]
+                    male_total = len(male_df)
+                    male_hired = (male_df["招聘决策"] == "进入面试").sum() if male_total > 0 else 0
+                    record[f"{stage}_男性录用比例(%)"] = round(male_hired / male_total * 100, 1) if male_total > 0 else 0
+                    # 女性
+                    female_df = df[df["性别"] == "女"]
+                    female_total = len(female_df)
+                    female_hired = (female_df["招聘决策"] == "进入面试").sum() if female_total > 0 else 0
+                    record[f"{stage}_女性录用比例(%)"] = round(female_hired / female_total * 100, 1) if female_total > 0 else 0
+
+            # 阶段总耗时
+            if "阶段总耗时（秒）" in df.columns:
+                record[f"{stage}_总耗时(秒)"] = df["阶段总耗时（秒）"].iloc[0] if len(df) > 0 else 0
+
+            # post阶段额外：平均信心 + 分性别平均信心
+            if stage == "post" and "决策信心" in df.columns:
+                # 整体平均信心
+                conf_vals = pd.to_numeric(df["决策信心"], errors="coerce").dropna()
+                record["post阶段平均决策信心(1-7)"] = conf_vals.mean() if len(conf_vals) > 0 else 0
+                # 分性别平均信心
+                if "性别" in df.columns:
+                    male_conf = pd.to_numeric(df[df["性别"] == "男"]["决策信心"], errors="coerce").dropna()
+                    female_conf = pd.to_numeric(df[df["性别"] == "女"]["决策信心"], errors="coerce").dropna()
+                    record["post阶段男性平均信心(1-7)"] = male_conf.mean() if len(male_conf) > 0 else 0
+                    record["post阶段女性平均信心(1-7)"] = female_conf.mean() if len(female_conf) > 0 else 0
+
+    # 7. 实验日期
+    record["实验完成时间"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # 保存为 CSV
+    df_master = pd.DataFrame([record])
+    master_path = os.path.join(exp_dir, "实验数据汇总.csv")
+    df_master.to_csv(master_path, index=False, encoding="utf-8-sig")
+    return master_path
+
+# ===================== 问卷保存函数 =====================
+def save_manipulation_check_data(bias_awareness, bias_detail):
+    manip_data = {
+        "bias_awareness": bias_awareness,
+        "bias_detail": bias_detail,
         "timestamp": datetime.now().isoformat()
     }
-    save_path = os.path.join(st.session_state.experiment_dir, "algorithm_dependency.json")
+    save_path = os.path.join(st.session_state.experiment_dir, "manipulation_check.json")
     with open(save_path, "w", encoding="utf-8") as f:
+        json.dump(manip_data, f, ensure_ascii=False, indent=2)
+    st.session_state.manipulation_check_done = True
+    st.session_state.show_manipulation_check = False
+    # 继续进入 post 阶段
+    next_stage = "post"
+    st.session_state.current_stage = next_stage
+    st.session_state.result_df = pd.DataFrame()
+    st.session_state.decisions = {}
+    st.session_state.current_page = 1
+    st.session_state.candidate_stay_time = {}
+    st.session_state.candidate_decision_time = {}
+    st.session_state.candidate_decision_modifications = {}
+    stage_config = get_stage_experiment_config(next_stage)
+    if stage_config["ai_assist"]:
+        result_df = batch_rating(st.session_state.candidates, bias_mode=stage_config["bias_mode"])
+        if result_df is None or result_df.empty:
+            st.error("AI评分失败")
+            return
+        st.session_state.result_df = result_df
+        st.session_state.decisions = {row["候选人姓名"]: UI_CONFIG["decision_options"][1] for _, row in result_df.iterrows()}
+    else:
+        rows, decisions = generate_non_ai_stage_data(next_stage, st.session_state.candidates)
+        st.session_state.result_df = pd.DataFrame(rows)
+        st.session_state.decisions = decisions
+    st.session_state.stage_start_time[next_stage] = time.time()
+    save_progress()
+    st.rerun()
+
+def save_final_questionnaire(dep_scores, fairness, recall, influence, correction, comments):
+    """保存最终问卷数据（依赖量表+事后回顾）"""
+    # 确保 post 阶段数据已保存（双重保险）
+    if st.session_state.current_stage == "post":
+        save_current_stage()
+    # 保存依赖量表
+    dep_data = {
+        "items": ALGORITHM_DEPENDENCY_ITEMS,
+        "scores": dep_scores,
+        "total_score": sum(dep_scores),
+        "timestamp": datetime.now().isoformat()
+    }
+    dep_path = os.path.join(st.session_state.experiment_dir, "algorithm_dependency.json")
+    with open(dep_path, "w", encoding="utf-8") as f:
         json.dump(dep_data, f, ensure_ascii=False, indent=2)
-    st.session_state.dependency_completed = True
-    st.session_state.show_dependency_form = False
+
+    # 保存事后回顾
+    debrief_data = {
+        "fairness": fairness,
+        "recall_ai_score": recall,
+        "influence": influence,
+        "correction_behavior": correction,
+        "comments": comments,
+        "timestamp": datetime.now().isoformat()
+    }
+    debrief_path = os.path.join(st.session_state.experiment_dir, "final_questionnaire.json")
+    with open(debrief_path, "w", encoding="utf-8") as f:
+        json.dump(debrief_data, f, ensure_ascii=False, indent=2)
+
+    # 生成汇总表
+    generate_master_table()
+    # 显示感谢界面
+    st.session_state.show_final_questionnaire = False
     st.session_state.show_thanks = True
     save_progress()
     st.rerun()
@@ -460,51 +611,11 @@ def save_dependency_data(scores):
 # ===================== 自定义CSS =====================
 st.markdown("""
     <style>
-    .main-header {
-        font-size: 28px;
-        font-weight: bold;
-        color: #2E86AB;
-        margin-bottom: 8px;
-    }
-    .sub-header {
-        font-size: 20px;
-        font-weight: bold;
-        color: #4A6FA5;
-        margin: 20px 0 10px 0;
-    }
-    .job-desc-box {
-        background-color: #f0f2f6;
-        padding: 15px;
-        border-radius: 10px;
-        margin-bottom: 20px;
-        border-left: 5px solid #2E86AB;
-    }
-    .stage-progress {
-        font-size: 16px;
-        margin-bottom: 15px;
-        color: #2C3E50;
-    }
-    .candidate-card {
-        background-color: #F9F9F9;
-        border: 1px solid #E0E0E0;
-        border-radius: 10px;
-        padding: 15px;
-        margin-bottom: 20px;
-    }
-    .custom-decision-radio .stRadio > div {
-        display: flex;
-        justify-content: space-between;
-        gap: 20px;
-    }
-    .custom-decision-radio .stRadio label {
-        font-size: 1.2rem;
-        font-weight: 500;
-        cursor: pointer;
-    }
-    /* 缩小侧边栏指标数值的字体，避免两位数显示不全 */
-    [data-testid="stSidebar"] [data-testid="stMetricValue"] {
-        font-size: 1rem !important;
-    }
+    .main-header { font-size: 28px; font-weight: bold; color: #2E86AB; margin-bottom: 8px; }
+    .sub-header { font-size: 20px; font-weight: bold; color: #4A6FA5; margin: 20px 0 10px 0; }
+    .stage-progress { font-size: 16px; margin-bottom: 15px; color: #2C3E50; }
+    .custom-decision-radio .stRadio > div { display: flex; justify-content: space-between; gap: 20px; }
+    [data-testid="stSidebar"] [data-testid="stMetricValue"] { font-size: 1rem !important; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -532,11 +643,7 @@ with st.sidebar:
 
         st.markdown("---")
         st.markdown("### 📊 招聘进度")
-
-        # 计划招聘人数固定为10（可根据需要修改初始值）
-        target_hires = st.session_state.target_hires  # 使用 session_state 中已有的值，不再显示输入框
-
-
+        target_hires = st.session_state.target_hires
         def get_current_stats():
             if not st.session_state.decisions:
                 return 0, 0, 0
@@ -544,8 +651,6 @@ with st.sidebar:
             pending = sum(1 for d in st.session_state.decisions.values() if d == "待定")
             rejected = sum(1 for d in st.session_state.decisions.values() if d == "拒绝")
             return hired, pending, rejected
-
-
         hired, pending, rejected = get_current_stats()
         col1, col2, col3 = st.columns(3)
         col1.metric("✅ 已进入面试", f"{hired} / {target_hires}")
@@ -561,24 +666,12 @@ with st.sidebar:
                 hired_list = [name for name, dec in st.session_state.decisions.items() if dec == "进入面试"]
                 pending_list = [name for name, dec in st.session_state.decisions.items() if dec == "待定"]
                 rejected_list = [name for name, dec in st.session_state.decisions.items() if dec == "拒绝"]
-
                 st.markdown("**✅ 进入面试**")
-                if hired_list:
-                    st.write("、".join(hired_list))
-                else:
-                    st.write("暂无")
-
+                st.write("、".join(hired_list) if hired_list else "暂无")
                 st.markdown("**⏳ 待定**")
-                if pending_list:
-                    st.write("、".join(pending_list))
-                else:
-                    st.write("暂无")
-
+                st.write("、".join(pending_list) if pending_list else "暂无")
                 st.markdown("**❌ 拒绝**")
-                if rejected_list:
-                    st.write("、".join(rejected_list))
-                else:
-                    st.write("暂无")
+                st.write("、".join(rejected_list) if rejected_list else "暂无")
             else:
                 st.info("尚未做出任何决策")
     else:
@@ -588,28 +681,21 @@ with st.sidebar:
 if not st.session_state.info_collected:
     st.markdown('<div class="main-header">📝 招聘决策实验系统</div>', unsafe_allow_html=True)
     st.markdown("请填写以下信息开始实验")
-
     with st.form("experimenter_form"):
-        exp_name = st.text_input("姓名", placeholder="请输入您的姓名")
-        exp_id = st.text_input("学号/学校", placeholder="请输入学号或学校名称")
+        exp_name = st.text_input("姓名")
+        exp_id = st.text_input("学号/学校")
         exp_gender = st.radio("性别", ["男", "女"], horizontal=True)
-        exp_age = st.number_input("年龄", min_value=18, max_value=100, step=1, value=25)
-        exp_major = st.text_input("专业", placeholder="填写本人专业，或已就业职位名称")
-        exp_education = st.selectbox("最高学历", ["本科", "硕士", "博士", "其他（专科及以下）"])
-        exp_ai_familiarity = st.slider("对人工智能的熟悉程度", 1, 7, 4, help="1=完全不了解，7=非常熟悉")
+        exp_age = st.number_input("年龄", 18, 100, 25)
+        exp_major = st.text_input("专业")
+        exp_education = st.selectbox("最高学历", ["本科", "硕士", "博士", "其他"])
+        exp_ai_familiarity = st.slider("对人工智能的熟悉程度", 1, 7, 4)
         exp_recruitment_exp = st.radio("是否有招聘经验", ["有", "无"], horizontal=True)
         exp_similar_exp = st.radio("是否参加过类似的招聘实验", ["是", "否"], horizontal=True)
-
-        st.markdown("#### 对以下情景内容做出选择（1代表完全不同意-7代表完全同意）")
-
+        st.markdown("#### 算法素养量表（1=完全不同意，7=完全同意）")
         alg_lit = []
         for i, q in enumerate(ALGORITHM_LITERACY_ITEMS):
-            alg_lit.append(st.slider(f"{i + 1}. {q}", 1, 7, 4, key=f"alg_{i}"))
-            if i < len(ALGORITHM_LITERACY_ITEMS) - 1:
-                st.write("")
-
+            alg_lit.append(st.slider(f"{i+1}. {q}", 1, 7, 4, key=f"alg_{i}"))
         submitted = st.form_submit_button("开始实验", type="primary")
-
         if submitted and exp_name and exp_id:
             clean_name = re.sub(r'[^\w\u4e00-\u9fff]', '_', exp_name)
             st.session_state.experimenter_id = f"{clean_name}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
@@ -617,22 +703,14 @@ if not st.session_state.info_collected:
             os.makedirs(exp_dir, exist_ok=True)
             st.session_state.experiment_dir = exp_dir
             st.session_state.experimenter_info = {
-                "姓名": exp_name,
-                "学号": exp_id,
-                "性别": exp_gender,
-                "年龄": exp_age,
-                "专业": exp_major,
-                "学历": exp_education,
-                "AI熟悉程度": exp_ai_familiarity,
-                "招聘经验": exp_recruitment_exp,
-                "类似实验经验": exp_similar_exp,
-                "实验者ID": st.session_state.experimenter_id,
-                "任务压力条件": FIXED_PRESSURE_CONDITION
+                "姓名": exp_name, "学号": exp_id, "性别": exp_gender, "年龄": exp_age,
+                "专业": exp_major, "学历": exp_education, "AI熟悉程度": exp_ai_familiarity,
+                "招聘经验": exp_recruitment_exp, "类似实验经验": exp_similar_exp,
+                "实验者ID": st.session_state.experimenter_id, "任务压力条件": FIXED_PRESSURE_CONDITION
             }
             st.session_state.algorithm_literacy = alg_lit
             st.session_state.pressure_condition = FIXED_PRESSURE_CONDITION
             st.session_state.info_collected = True
-
             metadata = {
                 "experimenter_id": st.session_state.experimenter_id,
                 "start_time": datetime.now().isoformat(),
@@ -645,7 +723,6 @@ if not st.session_state.info_collected:
             with open(os.path.join(exp_dir, "metadata.json"), "w", encoding="utf-8") as f:
                 json.dump(metadata, f, ensure_ascii=False, indent=2)
             save_progress()
-            st.success("信息已保存，实验开始！")
             st.rerun()
         elif submitted:
             st.warning("请填写姓名和学号")
@@ -655,15 +732,16 @@ if st.session_state.get("scroll_to_top", False):
     st.markdown('<script>window.scrollTo(0,0);</script>', unsafe_allow_html=True)
     st.session_state.scroll_to_top = False
 
+# 压力提示
 if st.session_state.pressure_condition == "高压力":
-    st.warning("⚠️ 请在每个阶段5分钟内完成所有决策。")
+    st.warning("⚠️ 每个阶段决策必须在5分钟内完成")
     if st.session_state.current_stage not in st.session_state.stage_start_time:
         st.session_state.stage_start_time[st.session_state.current_stage] = time.time()
     elapsed = time.time() - st.session_state.stage_start_time[st.session_state.current_stage]
     if elapsed > 300:
         st.error("⚠️ 当前阶段已超过5分钟！")
     else:
-        st.info(f"⏱️ 当前阶段已用时：{int(elapsed // 60)}分{int(elapsed % 60)}秒 / 5分钟")
+        st.info(f"⏱️ 当前阶段已用时：{int(elapsed//60)}分{int(elapsed%60)}秒 / 5分钟")
 else:
     st.success("请按照您的真实想法进行决策")
 
@@ -671,33 +749,66 @@ if st.session_state.current_stage not in st.session_state.stage_start_time:
     st.session_state.stage_start_time[st.session_state.current_stage] = time.time()
 
 current_stage_config = get_stage_experiment_config(st.session_state.current_stage)
-
 stage_names = [EXPERIMENT_STAGES[s]["name"] for s in get_stage_key_list()]
 current_idx = get_stage_key_list().index(st.session_state.current_stage)
-st.markdown(f"""
-    <div class="stage-progress">
-        实验阶段：{' → '.join([f"<b>{name}</b>" if i==current_idx else name for i, name in enumerate(stage_names)])}
-    </div>
-""", unsafe_allow_html=True)
-
-st.markdown(f"""
-    <div class="main-header">
-        {current_stage_config['name']}
-    </div>
-    <div style="color:#666; font-size:14px; margin-bottom:20px;">
-        当前模式：{'AI辅助' if current_stage_config['ai_assist'] else '无AI辅助'}
-    </div>
-""", unsafe_allow_html=True)
-
+st.markdown(f'<div class="stage-progress">实验阶段：{" → ".join([f"<b>{n}</b>" if i==current_idx else n for i,n in enumerate(stage_names)])}</div>', unsafe_allow_html=True)
+st.markdown(f'<div class="main-header">{current_stage_config["name"]}</div>', unsafe_allow_html=True)
+st.markdown(f'<div style="color:#666;">当前模式：{"AI辅助" if current_stage_config["ai_assist"] else "无AI辅助"}</div>', unsafe_allow_html=True)
 st.markdown(JOB_DESCRIPTION)
 st.divider()
 
-# ===================== 算法依赖量表表单与感谢界面 =====================
+# ===================== 问卷表单 =====================
+# 操纵检查表单
+if st.session_state.get("show_manipulation_check", False):
+    st.markdown("### 请回答以下问题（必填）")
+    st.markdown("在刚才的 **【实验2】AI辅助** 阶段，你观察到 AI 评分是否存在系统性偏差？")
+    with st.form("manipulation_check_form"):
+        bias_awareness = st.radio(
+            "你对 AI 评分的看法：",
+            ["没有注意到明显的偏差", "注意到女性候选人得分普遍偏低", "注意到男性候选人得分普遍偏低", "注意到其他类型的偏差"],
+            index=0
+        )
+        bias_detail = st.text_area("如果选择了“其他”，请具体描述：")
+        submitted = st.form_submit_button("提交并继续")
+        if submitted:
+            save_manipulation_check_data(bias_awareness, bias_detail)
+    st.stop()
+
+# 统一最终问卷（依赖量表+事后回顾）
+if st.session_state.get("show_final_questionnaire", False):
+    st.markdown("### 实验结束问卷")
+    st.markdown("请根据您的真实感受回答以下所有问题。")
+    with st.form("final_questionnaire_form"):
+        st.subheader("第一部分：算法依赖")
+        dep_scores = []
+        for i, item in enumerate(ALGORITHM_DEPENDENCY_ITEMS):
+            if "压力" in item:
+                score = st.slider(item, 1, 7, 4, key=f"dep_{i}")
+            else:
+                score = st.slider(item, 1, 5, 3, key=f"dep_{i}")
+            dep_scores.append(score)
+        
+        st.subheader("第二部分：实验反馈")
+        fairness = st.slider("我觉得 AI 评分的公平性如何？", 1, 7, 4, help="1=非常不公平，7=非常公平")
+        recall = st.slider("在后续独立决策时，我会不自觉地回忆起 AI 给出的分数。", 1, 7, 4)
+        influence = st.slider("AI 辅助阶段对我最后的独立决策产生了很大影响。", 1, 7, 4)
+        correction = st.radio(
+            "在刚才的独立决策阶段（实验3），你是否有意识地尝试纠正你察觉到的偏差？",
+            ["是，我尽量反着 AI 的建议来", "是，但我仍部分参考了 AI", "否，我认为 AI 的评分有道理", "我根本没注意到偏差"],
+            index=3
+        )
+        comments = st.text_area("其他反馈或感想（可选）")
+        
+        submitted = st.form_submit_button("提交并完成实验")
+        if submitted:
+            save_final_questionnaire(dep_scores, fairness, recall, influence, correction, comments)
+    st.stop()
+
+# 感谢界面
 if st.session_state.get("show_thanks", False):
     st.markdown("### 🎉 实验完成")
-    st.success("感谢您的决策与回答！您的数据已成功保存。")
+    st.success("感谢您的参与！您的数据已成功保存。")
     st.balloons()
-    # 再次保存当前阶段，确保最后阶段数据已写入
     if st.session_state.current_stage in get_stage_key_list():
         save_current_stage()
     st.markdown("请点击下方按钮下载实验数据压缩包：")
@@ -712,104 +823,61 @@ if st.session_state.get("show_thanks", False):
         )
     st.stop()
 
-if st.session_state.get("show_dependency_form", False):
-    st.markdown("### 最后一个问卷")
-    st.markdown("请根据您的真实感受，对以下陈述进行评分（1=完全不同意，5=完全同意）")
-    with st.form("dependency_form"):
-        scores = []
-        for i, item in enumerate(ALGORITHM_DEPENDENCY_ITEMS):
-            # 压力题使用 1-7 分制，默认值为 4；其他题目使用 1-5 分制，默认值为 3
-            if "压力" in item:  # 通过关键词识别压力题
-                score = st.slider(item, 1, 7, 4, key=f"dep_{i}")
-            else:
-                score = st.slider(item, 1, 5, 3, key=f"dep_{i}")
-            scores.append(score)
-        submitted_dep = st.form_submit_button("提交量表")
-        if submitted_dep:
-            save_dependency_data(scores)
-    st.stop()
-
-# ===================== 简历自动读取（替换手动上传） =====================
+# ===================== 简历自动读取 =====================
 if not st.session_state.resumes_uploaded:
     st.markdown('<div class="sub-header">📁 简历自动加载</div>', unsafe_allow_html=True)
-    st.info("系统将自动从“resume”文件夹中读取简历文件，并匹配“photo”文件夹中的照片。")
-
-    with st.spinner("正在自动加载简历..."):
+    with st.spinner("正在加载简历..."):
         candidates, errors = auto_load_candidates(RESUME_FOLDER, PHOTO_FOLDER)
-        if errors:
-            for err in errors:
-                st.warning(err)
+        for err in errors:
+            st.warning(err)
         if not candidates:
-            st.error("未能加载任何候选人，请检查“resume”文件夹中的文件。")
+            st.error("未找到有效简历")
             st.stop()
-        else:
-            st.session_state.candidates = candidates
-            # 初始化当前阶段的数据（默认是 pre 阶段）
-            if current_stage_config["ai_assist"]:
-                result_df = batch_rating(candidates, bias_mode=current_stage_config["bias_mode"])
-                if result_df is None or result_df.empty:
-                    st.error("AI评分失败，请检查数据或联系管理员。")
-                    st.stop()
-                st.session_state.result_df = result_df
-                st.session_state.decisions = {row["候选人姓名"]: UI_CONFIG["decision_options"][1] for _, row in result_df.iterrows()}
-            else:
-                rows, decisions = generate_non_ai_stage_data(st.session_state.current_stage, candidates)
-                st.session_state.result_df = pd.DataFrame(rows)
-                st.session_state.decisions = decisions
+        st.session_state.candidates = candidates
+        if initialize_stage_data(st.session_state.current_stage):
             st.session_state.resumes_uploaded = True
             save_progress()
-            st.success(f"✅ 成功加载 {len(candidates)} 位候选人！")
             st.rerun()
-    st.stop()
+        else:
+            st.stop()
 
 # ===================== 招聘决策标注 =====================
 if st.session_state.resumes_uploaded:
     if st.session_state.stage_completed.get(st.session_state.current_stage, False):
         st.success(f"✅ {current_stage_config['name']} 已完成！")
-        st.write("")
-        st.write("")
-        st.write("")
-        st.write("")
-        next_stage_key = get_next_stage(st.session_state.current_stage)
-        if next_stage_key is None:
+        next_key = get_next_stage(st.session_state.current_stage)
+        if next_key is None:
             if st.button("📤 提交实验数据", type="primary", use_container_width=True):
-                finalize_experiment()
+                # 先保存 post 阶段数据，再显示问卷
+                save_current_stage()
+                st.session_state.show_final_questionnaire = True
+                st.rerun()
         else:
-            next_stage_name = EXPERIMENT_STAGES[next_stage_key]["name"]
-            button_text = f"➡️ 进入{next_stage_name}"
-            if st.button(button_text, type="primary", use_container_width=True):
+            next_name = EXPERIMENT_STAGES[next_key]["name"]
+            if st.button(f"➡️ 进入{next_name}", type="primary", use_container_width=True):
                 switch_to_next_stage()
     else:
         if st.session_state.result_df.empty:
-            st.error("数据加载错误，请重新上传简历。")
+            st.error("数据错误")
             st.stop()
-
         st.markdown('<div class="sub-header">🎯 招聘决策标注</div>', unsafe_allow_html=True)
-
         if current_stage_config["ai_assist"]:
-            sort_key = st.selectbox(
-                "选择候选人排序方式",
-                options=list(SORT_OPTIONS.keys()),
-                format_func=lambda x: SORT_OPTIONS[x]["name"],
-                key="sort_selector",
-                label_visibility="collapsed"
-            )
+            sort_key = st.selectbox("排序方式", list(SORT_OPTIONS.keys()), format_func=lambda x: SORT_OPTIONS[x]["name"], key="sort")
             sorted_df = sort_candidates_df(st.session_state.result_df, sort_key)
         else:
             sorted_df = st.session_state.result_df
 
-        total_candidates = len(sorted_df)
+        total = len(sorted_df)
         page_size = UI_CONFIG["max_candidates_per_page"]
-        total_pages = max(1, (total_candidates + page_size - 1) // page_size)
+        total_pages = max(1, (total + page_size - 1)//page_size)
+        page = max(1, min(st.session_state.current_page, total_pages))
+        start = (page-1)*page_size
+        end = min(start+page_size, total)
+        page_df = sorted_df.iloc[start:end]
 
-        current_page = max(1, min(st.session_state.current_page, total_pages))
-        start_idx = (current_page - 1) * page_size
-        end_idx = min(start_idx + page_size, total_candidates)
-        paginated_df = sorted_df.iloc[start_idx:end_idx]
-
-        for idx, row in paginated_df.iterrows():
+        for idx, row in page_df.iterrows():
             name = row["候选人姓名"]
-            st.markdown(f"### <b>📄 【{row['排名']}】{name}</b>", unsafe_allow_html=True)
+            st.markdown(f"### 📄 【{row['排名']}】{name}")
             if current_stage_config["show_score"]:
                 st.markdown(f"<span style='color:#666;'>AI评分：{row['最终评分']}</span>", unsafe_allow_html=True)
 
@@ -895,6 +963,17 @@ if st.session_state.resumes_uploaded:
                     label_visibility="collapsed"
                 )
                 st.markdown('</div>', unsafe_allow_html=True)
+            
+            # 如果是 post 阶段，显示决策信心滑块
+            if st.session_state.current_stage == "post":
+                current_confidence = st.session_state.post_confidence.get(name, 4)
+                confidence = st.slider(
+                    f"你对此决策的信心 (1=非常没信心, 7=非常有信心)",
+                    1, 7, current_confidence,
+                    key=f"confidence_{name}_post"
+                )
+                st.session_state.post_confidence[name] = confidence
+
             if decision != current_decision:
                 record_decision_time(name, decision, current_decision)
                 st.session_state.decisions[name] = decision
@@ -902,37 +981,33 @@ if st.session_state.resumes_uploaded:
 
             st.divider()
 
-        col_prev, col_info, col_next = st.columns([1, 2, 1])
-        with col_prev:
-            if st.button("← 上一页", use_container_width=True, disabled=(current_page == 1)):
+        c1, c2, c3 = st.columns([1,2,1])
+        with c1:
+            if st.button("← 上一页", disabled=(page==1)):
                 st.session_state.current_page -= 1
                 st.session_state.scroll_to_top = True
                 st.rerun()
-        with col_info:
-            st.markdown(
-                f"<div style='text-align:center; font-size:16px;'>第 {current_page} 页 / 共 {total_pages} 页</div>",
-                unsafe_allow_html=True
-            )
-        with col_next:
-            if st.button("→ 下一页", use_container_width=True, disabled=(current_page == total_pages)):
+        with c2:
+            st.markdown(f"<div style='text-align:center'>第 {page} / {total_pages} 页</div>", unsafe_allow_html=True)
+        with c3:
+            if st.button("下一页 →", disabled=(page==total_pages)):
                 st.session_state.current_page += 1
                 st.session_state.scroll_to_top = True
                 st.rerun()
 
         if is_stage_complete():
-            st.success("在完成决策之前请不要误触进入下一阶段！")
-            st.write("")
-            st.write("")
-            next_stage_key = get_next_stage(st.session_state.current_stage)
-            if next_stage_key is None:
-                if st.button("📤 提交实验数据", type="primary", use_container_width=True):
-                    finalize_experiment()
+            st.success("✅ 本阶段完成，点击下方按钮继续")
+            next_key = get_next_stage(st.session_state.current_stage)
+            if next_key is None:
+                if st.button("📤 提交实验数据", type="primary"):
+                    # 保存 post 阶段数据再进入问卷
+                    save_current_stage()
+                    st.session_state.show_final_questionnaire = True
+                    st.rerun()
             else:
-                next_stage_name = EXPERIMENT_STAGES[next_stage_key]["name"]
-                button_text = f"➡️ 进入{next_stage_name}"
-                if st.button(button_text, type="primary", use_container_width=True):
+                if st.button(f"➡️ 进入{EXPERIMENT_STAGES[next_key]['name']}", type="primary"):
                     switch_to_next_stage()
         else:
-            missing = [name for name in st.session_state.result_df["候选人姓名"] if name not in st.session_state.decisions]
+            missing = [n for n in st.session_state.result_df["候选人姓名"] if n not in st.session_state.decisions]
             if missing:
-                st.warning(f"以下候选人尚未做出决策：{', '.join(missing)}")
+                st.warning(f"未决策：{', '.join(missing)}")
