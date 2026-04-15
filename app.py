@@ -14,6 +14,7 @@ from config import (
     EXPERIMENT_STAGES, STAY_TIME_CONFIG, SORT_OPTIONS,
     RATING_WEIGHTS, BIAS_CONFIG, JOB_DESCRIPTION,
     ALGORITHM_LITERACY_ITEMS, ALGORITHM_DEPENDENCY_ITEMS,
+    PRESSURE_MANIPULATION_ITEM,  # 新增导入
     FIXED_PRESSURE_CONDITION,
     RESUME_FOLDER, PHOTO_FOLDER
 )
@@ -485,7 +486,14 @@ def generate_master_table():
             record[f"算法依赖_题{i}"] = s
         record["算法依赖_总分"] = dep.get("total_score", 0)
 
-    # 6. 各阶段决策统计（增加分性别录用比例）
+    # 6. 压力操控检查（独立题目）
+    pressure_path = os.path.join(exp_dir, "pressure_manipulation.json")
+    if os.path.exists(pressure_path):
+        with open(pressure_path, "r", encoding="utf-8") as f:
+            pres = json.load(f)
+        record["压力操控检查得分"] = pres.get("score", "")
+
+    # 7. 各阶段决策统计（增加分性别录用比例）
     for stage in ["pre", "mid", "post"]:
         csv_path = os.path.join(exp_dir, f"stage_{stage}.csv")
         if os.path.exists(csv_path):
@@ -525,7 +533,7 @@ def generate_master_table():
                     record["post阶段男性平均信心(1-7)"] = male_conf.mean() if len(male_conf) > 0 else 0
                     record["post阶段女性平均信心(1-7)"] = female_conf.mean() if len(female_conf) > 0 else 0
 
-    # 7. 实验日期
+    # 8. 实验日期
     record["实验完成时间"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # 保存为 CSV
@@ -571,12 +579,13 @@ def save_manipulation_check_data(bias_awareness, bias_detail):
     save_progress()
     st.rerun()
 
-def save_final_questionnaire(dep_scores, fairness, recall, influence, correction, comments):
-    """保存最终问卷数据（依赖量表+事后回顾）"""
+def save_final_questionnaire(dep_scores, pressure_score, fairness, recall, influence, correction, comments):
+    """保存最终问卷数据（依赖量表+压力操控题+事后回顾）"""
     # 确保 post 阶段数据已保存（双重保险）
     if st.session_state.current_stage == "post":
         save_current_stage()
-    # 保存依赖量表
+
+    # 1. 保存算法依赖量表（6题）
     dep_data = {
         "items": ALGORITHM_DEPENDENCY_ITEMS,
         "scores": dep_scores,
@@ -587,7 +596,17 @@ def save_final_questionnaire(dep_scores, fairness, recall, influence, correction
     with open(dep_path, "w", encoding="utf-8") as f:
         json.dump(dep_data, f, ensure_ascii=False, indent=2)
 
-    # 保存事后回顾
+    # 2. 保存压力操控检验题（独立题目）
+    pressure_data = {
+        "item": PRESSURE_MANIPULATION_ITEM,
+        "score": pressure_score,
+        "timestamp": datetime.now().isoformat()
+    }
+    pressure_path = os.path.join(st.session_state.experiment_dir, "pressure_manipulation.json")
+    with open(pressure_path, "w", encoding="utf-8") as f:
+        json.dump(pressure_data, f, ensure_ascii=False, indent=2)
+
+    # 3. 保存事后回顾
     debrief_data = {
         "fairness": fairness,
         "recall_ai_score": recall,
@@ -686,7 +705,7 @@ if not st.session_state.info_collected:
         exp_id = st.text_input("学号/学校（说明：天津大学学生只需填写学号、已就业或其余学校请填写单位名称）")
         exp_gender = st.radio("性别", ["男", "女"], horizontal=True)
         exp_age = st.number_input("年龄", 18, 100, 25)
-        exp_major = st.text_input("专业")
+        exp_major = st.text_input("专业/就业岗位")
         exp_education = st.selectbox("最高学历（含在读）", ["本科", "硕士", "博士", "其他（专科及以下）"])
         exp_ai_familiarity = st.slider("对人工智能的熟悉程度（1分代表不熟悉，7分代表非常熟悉）", 1, 7, 4)
         exp_recruitment_exp = st.radio("是否有招聘经验", ["有", "无"], horizontal=True)
@@ -774,21 +793,21 @@ if st.session_state.get("show_manipulation_check", False):
             save_manipulation_check_data(bias_awareness, bias_detail)
     st.stop()
 
-# 统一最终问卷（依赖量表+事后回顾）
+# 统一最终问卷（依赖量表+压力题+事后回顾）
 if st.session_state.get("show_final_questionnaire", False):
     st.markdown("### 实验结束问卷")
     st.markdown("请根据您的真实感受回答以下所有问题。")
     with st.form("final_questionnaire_form"):
-        st.subheader("第一部分：算法依赖")
+        st.subheader("第一部分")
         dep_scores = []
         for i, item in enumerate(ALGORITHM_DEPENDENCY_ITEMS):
-            if "压力" in item:
-                score = st.slider(item, 1, 7, 4, key=f"dep_{i}")
-            else:
-                score = st.slider(item, 1, 5, 3, key=f"dep_{i}")
+            score = st.slider(item, 1, 5, 3, key=f"dep_{i}")
             dep_scores.append(score)
-        
-        st.subheader("第二部分：实验反馈")
+
+        st.subheader("第二部分")
+        pressure_score = st.slider(PRESSURE_MANIPULATION_ITEM, 1, 7, 4, key="pressure_manip")
+
+        st.subheader("第三部分")
         fairness = st.slider("我觉得 AI 评分的公平性如何？", 1, 7, 4, help="1=非常不公平，7=非常公平")
         recall = st.slider("在后续独立决策时，我会不自觉地回忆起 AI 给出的分数。", 1, 7, 4)
         influence = st.slider("AI 辅助阶段对我最后的独立决策产生了很大影响。", 1, 7, 4)
@@ -801,7 +820,7 @@ if st.session_state.get("show_final_questionnaire", False):
         
         submitted = st.form_submit_button("提交并完成实验")
         if submitted:
-            save_final_questionnaire(dep_scores, fairness, recall, influence, correction, comments)
+            save_final_questionnaire(dep_scores, pressure_score, fairness, recall, influence, correction, comments)
     st.stop()
 
 # 感谢界面
@@ -996,7 +1015,7 @@ if st.session_state.resumes_uploaded:
                 st.rerun()
 
         if is_stage_complete():
-            st.success("✅ 在本阶段完成前，请不要误触进入下一阶段")
+            st.success("✅在本阶段完成前，请不要误触进入下一阶段")
             next_key = get_next_stage(st.session_state.current_stage)
             if next_key is None:
                 if st.button("📤 提交实验数据", type="primary"):
