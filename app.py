@@ -646,6 +646,21 @@ with st.sidebar:
         st.write(f"**姓名**：{st.session_state.experimenter_info.get('姓名', '未知')}")
         st.write(f"**学号**：{st.session_state.experimenter_info.get('学号', '未知')}")
 
+        # 压力提示（移动到侧边栏）
+        st.markdown("---")
+        st.markdown("### ⏱️ 任务压力提示")
+        if st.session_state.pressure_condition == "高压力":
+            st.warning("⚠️ 每个阶段决策需在10分钟内完成（进入此阶段既开始计时，点击决策刷新计时）")
+            if st.session_state.current_stage not in st.session_state.stage_start_time:
+                st.session_state.stage_start_time[st.session_state.current_stage] = time.time()
+            elapsed = time.time() - st.session_state.stage_start_time[st.session_state.current_stage]
+            if elapsed > 600:
+                st.error("⚠️ 当前阶段已超过10分钟！")
+            else:
+                st.info(f"⏱️ 当前阶段已用时：{int(elapsed//60)}分{int(elapsed%60)}秒 / 10分钟")
+        else:
+            st.success("请按照您的真实想法进行决策")
+
         if not st.session_state.resumes_uploaded:
             if st.button("✏️ 修改信息", use_container_width=True):
                 for key in list(st.session_state.keys()):
@@ -751,18 +766,7 @@ if st.session_state.get("scroll_to_top", False):
     st.markdown('<script>window.scrollTo(0,0);</script>', unsafe_allow_html=True)
     st.session_state.scroll_to_top = False
 
-# 压力提示
-if st.session_state.pressure_condition == "高压力":
-    st.warning("⚠️ 每个阶段决策必须在5分钟内完成")
-    if st.session_state.current_stage not in st.session_state.stage_start_time:
-        st.session_state.stage_start_time[st.session_state.current_stage] = time.time()
-    elapsed = time.time() - st.session_state.stage_start_time[st.session_state.current_stage]
-    if elapsed > 300:
-        st.error("⚠️ 当前阶段已超过5分钟！")
-    else:
-        st.info(f"⏱️ 当前阶段已用时：{int(elapsed//60)}分{int(elapsed%60)}秒 / 5分钟")
-else:
-    st.success("请按照您的真实想法进行决策")
+# 压力提示已移至侧边栏，此处不再显示
 
 if st.session_state.current_stage not in st.session_state.stage_start_time:
     st.session_state.stage_start_time[st.session_state.current_stage] = time.time()
@@ -1015,7 +1019,7 @@ if st.session_state.resumes_uploaded:
                 st.rerun()
 
         if is_stage_complete():
-            st.success("✅在本阶段完成前，请不要误触进入下一阶段")
+            st.success("✅在本阶段完成前，请不要误触进入下一阶段，本阶段一共六页")
             next_key = get_next_stage(st.session_state.current_stage)
             if next_key is None:
                 if st.button("📤 提交实验数据", type="primary"):
